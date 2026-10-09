@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT: float = 30.0
     VLLM_API_KEY: str | None = None
+    VLLM_LOG_SECRET_HINT: bool = True
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
@@ -813,6 +814,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # API key for vLLM API server
     "VLLM_API_KEY": lambda: os.environ.get("VLLM_API_KEY", None),
+    # Whether a redacted secret in the startup log (an API key, a Hugging
+    # Face token) keeps its first and last three characters, as in
+    # "sk-***345", so an operator can tell which secret the server loaded.
+    # Set to 0 to log every secret as "***". A secret shorter than 12
+    # characters is always logged as "***".
+    "VLLM_LOG_SECRET_HINT": lambda: bool(int(os.getenv("VLLM_LOG_SECRET_HINT", "1"))),
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
         os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
@@ -2355,6 +2362,7 @@ def compile_factors() -> dict[str, object]:
         # Credential; never affects compiled artifacts and must not be
         # persisted in cache_key_factors.json.
         "VLLM_API_KEY",
+        "VLLM_LOG_SECRET_HINT",
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",

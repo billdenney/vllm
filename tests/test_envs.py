@@ -48,6 +48,23 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
+def test_log_secret_hint_default_and_override(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_LOG_SECRET_HINT", raising=False)
+    assert envs.VLLM_LOG_SECRET_HINT is True
+
+    monkeypatch.setenv("VLLM_LOG_SECRET_HINT", "0")
+    assert envs.VLLM_LOG_SECRET_HINT is False
+
+    monkeypatch.setenv("VLLM_LOG_SECRET_HINT", "1")
+    assert envs.VLLM_LOG_SECRET_HINT is True
+
+
+def test_log_secret_hint_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_LOG_SECRET_HINT", "0")
+
+    assert "VLLM_LOG_SECRET_HINT" not in envs.compile_factors()
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

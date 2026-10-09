@@ -270,13 +270,38 @@ def jsonify_non_default_args(
 # Fields whose values must never be logged verbatim.
 _SENSITIVE_ARG_FIELDS = frozenset({"api_key", "hf_token", "watermark_config"})
 
+# A secret shorter than this is logged as "***" even with the hint enabled:
+# three characters at each end of a short secret would give away most of it.
+_SECRET_HINT_MIN_LEN = 12
+
+
+def _redact_secret(value: Any) -> Any:
+    """Redact one sensitive value for logging.
+
+    With `VLLM_LOG_SECRET_HINT` (the default) a string of at least
+    `_SECRET_HINT_MIN_LEN` characters keeps its first and last three
+    characters ("sk-***345"), so an operator can tell which secret the server
+    loaded without the log holding it. A list or tuple of strings is redacted
+    element by element. Anything else, and every secret when the hint is off,
+    is "***".
+    """
+    if isinstance(value, (list, tuple)):
+        return [_redact_secret(item) for item in value]
+    if (
+        envs.VLLM_LOG_SECRET_HINT
+        and isinstance(value, str)
+        and len(value) >= _SECRET_HINT_MIN_LEN
+    ):
+        return f"{value[:3]}***{value[-3:]}"
+    return "***"
+
 
 def redact_sensitive_args(args: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of `args` with sensitive values redacted for logging."""
     if not any(key in _SENSITIVE_ARG_FIELDS for key in args):
         return args
     return {
-        key: ("***" if key in _SENSITIVE_ARG_FIELDS else value)
+        key: (_redact_secret(value) if key in _SENSITIVE_ARG_FIELDS else value)
         for key, value in args.items()
     }
 

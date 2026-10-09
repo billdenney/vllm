@@ -5,6 +5,7 @@ from argparse import Namespace
 
 import pytest
 
+from vllm import envs
 from vllm.entrypoints.generate.base.protocol import StreamOptions
 from vllm.entrypoints.serve.utils import api_utils
 from vllm.entrypoints.serve.utils.api_utils import (
@@ -118,17 +119,20 @@ class TestGetMaxTokens:
 
 class TestRedactSensitiveArgs:
     API_KEY = "sk-test-secret-12345"
+    # What the default hint shows of API_KEY: three characters at each end.
+    API_KEY_HINT = "sk-***345"
 
-    def test_redact_replaces_sensitive_values_only(self):
+    def test_redact_keeps_a_hint_of_long_secrets_by_default(self):
         args = {
             "api_key": self.API_KEY,
+            # Shorter than the hint minimum, so fully redacted.
             "hf_token": "hf_secret",
             "watermark_config": {"algorithm": "gumbel", "key": 42},
             "other": "visible",
         }
         redacted = redact_sensitive_args(args)
         assert redacted == {
-            "api_key": "***",
+            "api_key": self.API_KEY_HINT,
             "hf_token": "***",
             "watermark_config": "***",
             "other": "visible",
@@ -140,6 +144,41 @@ class TestRedactSensitiveArgs:
             "watermark_config": {"algorithm": "gumbel", "key": 42},
             "other": "visible",
         }
+
+    def test_redact_hint_off_redacts_every_secret_fully(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_LOG_SECRET_HINT", False)
+        args = {
+            "api_key": self.API_KEY,
+            "hf_token": "hf_TESTTOKENVALUE123",
+            "watermark_config": {"algorithm": "gumbel", "key": 42},
+            "other": "visible",
+        }
+        assert redact_sensitive_args(args) == {
+            "api_key": "***",
+            "hf_token": "***",
+            "watermark_config": "***",
+            "other": "visible",
+        }
+
+    def test_redact_hint_minimum_length(self):
+        # Exactly the minimum keeps a hint; one short of it does not.
+        at_min = "a" * 12
+        assert redact_sensitive_args({"api_key": at_min}) == {"api_key": "aaa***aaa"}
+        assert redact_sensitive_args({"api_key": "a" * 11}) == {"api_key": "***"}
+        assert redact_sensitive_args({"api_key": ""}) == {"api_key": "***"}
+
+    def test_redact_list_of_keys_element_by_element(self):
+        keys = [self.API_KEY, "short", "sk-other-secret-67890"]
+        assert redact_sensitive_args({"api_key": keys}) == {
+            "api_key": [self.API_KEY_HINT, "***", "sk-***890"]
+        }
+        assert redact_sensitive_args({"api_key": tuple(keys)}) == {
+            "api_key": [self.API_KEY_HINT, "***", "sk-***890"]
+        }
+
+    def test_redact_non_string_secret_is_fully_redacted(self):
+        assert redact_sensitive_args({"api_key": 123456789012}) == {"api_key": "***"}
+        assert redact_sensitive_args({"api_key": None}) == {"api_key": "***"}
 
     def test_no_sensitive_fields_returns_original(self):
         args = {"model_tag": "org/model", "other": "visible"}
@@ -158,10 +197,21 @@ class TestRedactSensitiveArgs:
             api_utils.log_non_default_args(args=Namespace())
         message = caplog.text
         assert self.API_KEY not in message
-        assert "'api_key': '***'" in message
+        assert f"'api_key': '{self.API_KEY_HINT}'" in message
         # non-sensitive args are still logged
         assert "org/model" in message
         assert "qwen3_coder" in message
+
+    def test_api_key_fully_redacted_in_log_with_hint_off(self, monkeypatch, caplog):
+        monkeypatch.setattr(envs, "VLLM_LOG_SECRET_HINT", False)
+        non_default = {"model_tag": "org/model", "api_key": self.API_KEY}
+        monkeypatch.setattr(api_utils, "get_non_default_args", lambda args: non_default)
+        with caplog.at_level("INFO", logger="vllm.entrypoints.serve.utils.api_utils"):
+            api_utils.log_non_default_args(args=Namespace())
+        message = caplog.text
+        assert self.API_KEY not in message
+        assert "sk-" not in message
+        assert "'api_key': '***'" in message
 
     def test_hf_token_not_in_log(self, monkeypatch, caplog):
         hf_token = "hf_TESTTOKENVALUE123"
@@ -175,5 +225,5 @@ class TestRedactSensitiveArgs:
             api_utils.log_non_default_args(args=Namespace())
         message = caplog.text
         assert hf_token not in message
-        assert "'hf_token': '***'" in message
+        assert "'hf_token': 'hf_***123'" in message
         assert "org/model" in message

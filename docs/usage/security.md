@@ -151,6 +151,8 @@ The `--api-key` flag (or `VLLM_API_KEY` environment variable) provides authentic
 
 **Important:** Do not rely exclusively on `--api-key` for securing access to vLLM. Additional security measures are required for production deployments.
 
+The server's startup log lists its non-default arguments. A secret among them (`api_key`, `hf_token`) is never logged verbatim: by default it keeps its first and last three characters (`sk-***345`), so an operator can tell which secret the server loaded, and a secret shorter than 12 characters shows as `***`. Set `VLLM_LOG_SECRET_HINT=0` to log every secret as `***`.
+
 ### Protected Endpoints (Require API Key)
 
 When `--api-key` is configured, the following endpoints require Bearer token authentication:

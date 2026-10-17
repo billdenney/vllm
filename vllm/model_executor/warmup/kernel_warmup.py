@@ -107,32 +107,6 @@ def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
     return json.dumps(metadata, sort_keys=True), len(configs)
 
 
-def _all_ranks_have_matching_cache(path: Path, group) -> bool:
-    """True iff every rank in ``group`` has its own, mutually consistent file."""
-    fingerprint = _autotune_cache_fingerprint(path)
-    if group.world_size == 1:
-        return fingerprint is not None
-    gathered: list[tuple[str, int] | None] = [None] * group.world_size
-    torch.distributed.all_gather_object(gathered, fingerprint, group=group.cpu_group)
-    return fingerprint is not None and all(f == fingerprint for f in gathered)
-
-
-class _ReplayCacheState(NamedTuple):
-    """One rank's autotune cache file, as replay mode sees it."""
-
-    status: str  # "missing", "malformed" or "present"
-    fingerprint: tuple[str, int] | None
-
-
-def _replay_cache_state(path: Path) -> _ReplayCacheState:
-    if not path.exists():
-        return _ReplayCacheState("missing", None)
-    fingerprint = _autotune_cache_fingerprint(path)
-    if fingerprint is None:
-        return _ReplayCacheState("malformed", None)
-    return _ReplayCacheState("present", fingerprint)
-
-
 def _gather_from_group(obj: _T, group: "GroupCoordinator") -> list[_T]:
     """All-gather a picklable object over a group.
 

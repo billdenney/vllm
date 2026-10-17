@@ -16,6 +16,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    load_flashinfer_autotune_cache_only,
     resolve_flashinfer_autotune_file,
 )
 from vllm.platforms import current_platform
@@ -47,22 +48,16 @@ def kernel_warmup(worker: "Worker"):
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
     )
-    replay = worker.vllm_config.kernel_config.flashinfer_autotune_cache_mode == "replay"
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
-        if replay:
+        if envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_ONLY:
             logger.warning_once(
-                "FlashInfer autotune cache mode 'replay' has no effect, since "
-                "FlashInfer autotuning is disabled."
+                "VLLM_FLASHINFER_AUTOTUNE_CACHE_ONLY has no effect because "
+                "FlashInfer autotune is disabled; no cache is loaded."
             )
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
-    elif replay:
-        logger.warning_once(
-            "FlashInfer autotune cache mode 'replay' has no effect, since "
-            "FlashInfer autotuning needs FlashInfer and a GPU of SM 9.0 or later."
-        )
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
@@ -107,32 +102,6 @@ def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
     return json.dumps(metadata, sort_keys=True), len(configs)
 
 
-def _all_ranks_have_matching_cache(path: Path, group) -> bool:
-    """True iff every rank in ``group`` has its own, mutually consistent file."""
-    fingerprint = _autotune_cache_fingerprint(path)
-    if group.world_size == 1:
-        return fingerprint is not None
-    gathered: list[tuple[str, int] | None] = [None] * group.world_size
-    torch.distributed.all_gather_object(gathered, fingerprint, group=group.cpu_group)
-    return fingerprint is not None and all(f == fingerprint for f in gathered)
-
-
-class _ReplayCacheState(NamedTuple):
-    """One rank's autotune cache file, as replay mode sees it."""
-
-    status: str  # "missing", "malformed" or "present"
-    fingerprint: tuple[str, int] | None
-
-
-def _replay_cache_state(path: Path) -> _ReplayCacheState:
-    if not path.exists():
-        return _ReplayCacheState("missing", None)
-    fingerprint = _autotune_cache_fingerprint(path)
-    if fingerprint is None:
-        return _ReplayCacheState("malformed", None)
-    return _ReplayCacheState("present", fingerprint)
-
-
 def _gather_from_group(obj: _T, group: "GroupCoordinator") -> list[_T]:
     """All-gather a picklable object over a group.
 
@@ -161,7 +130,7 @@ _CacheStatus = Literal["missing", "unreadable", "malformed", "present"]
 
 
 class _ReplayCacheState(NamedTuple):
-    """One rank's autotune cache file, as replay mode sees it."""
+    """One rank's autotune cache file, as the cache-only mode sees it."""
 
     status: _CacheStatus
     fingerprint: tuple[str, int] | None
@@ -171,7 +140,7 @@ class _ReplayCacheState(NamedTuple):
 def _replay_cache_state(
     path: Path, tune_group: "GroupCoordinator"
 ) -> _ReplayCacheState:
-    """Classify this rank's autotune cache file for replay mode.
+    """Classify this rank's autotune cache file for the cache-only mode.
 
     Args:
         path: This rank's cache file.
@@ -195,86 +164,6 @@ def _replay_cache_state(
     return _ReplayCacheState("present", fingerprint, ranks)
 
 
-def _check_replay_cache_states(
-    states: list[_ReplayCacheState], cache_dir: Path, *, recorded: bool
-) -> bool:
-    """Decide what a replay-mode start does with the world's cache files.
-
-    Every rank gets the same states and so the same decision, raising
-    together rather than leaving the others in a collective. A record missing
-    on some ranks is not completed by tuning those ranks: that would re-tune
-    silently and rewrite the record.
-
-    Args:
-        states: Every rank's state, in world rank order.
-        cache_dir: The directory to delete to record the tactics again.
-        recorded: Whether this start just saved the record, which must then
-            exist on every rank.
-
-    Returns:
-        False when no rank has a file and nothing was recorded yet, so this
-        start records the tactics; True when every rank's file is present
-        and the files agree within each tuning group.
-
-    Raises:
-        RuntimeError: Otherwise, with the same message on every rank.
-    """
-    what = "the record this start saved" if recorded else "the record"
-    if not recorded and all(state.status == "missing" for state in states):
-        return False
-    problems = [
-        f"rank {rank}: {state.status}"
-        for rank, state in enumerate(states)
-        if state.status != "present"
-    ]
-    if problems:
-        raise RuntimeError(
-            f"FlashInfer autotune cache mode is 'replay', but {what} is not "
-            f"usable on every rank ({', '.join(problems)}). Delete {cache_dir} "
-            "to record the tactics again."
-        )
-    fingerprints: dict[tuple[int, ...], set] = {}
-    for state in states:
-        fingerprints.setdefault(state.tuning_group, set()).add(state.fingerprint)
-    split = sorted(group for group, found in fingerprints.items() if len(found) > 1)
-    if split:
-        raise RuntimeError(
-            f"FlashInfer autotune cache mode is 'replay', but {what} differs "
-            f"across the ranks of tuning groups {split}. Delete {cache_dir} to "
-            "record the tactics again."
-        )
-    return True
-
-
-def _load_replay_cache(tuner, path: Path, world: "GroupCoordinator") -> None:
-    """Load this rank's record, raising on every rank if any rank fails.
-
-    Args:
-        tuner: FlashInfer's ``AutoTuner``.
-        path: This rank's cache file.
-        world: The world group, over which the results are gathered.
-
-    Raises:
-        RuntimeError: When FlashInfer rejects or cannot read the file on any
-            rank, with the same message on every rank.
-    """
-    try:
-        loaded = bool(tuner.load_configs(str(path)))
-    except Exception:
-        logger.exception("FlashInfer could not load the autotune cache %s.", path)
-        loaded = False
-    gathered = _gather_from_group(loaded, world)
-    rejected = [rank for rank, ok in enumerate(gathered) if not ok]
-    if rejected:
-        raise RuntimeError(
-            "FlashInfer autotune cache mode is 'replay', but FlashInfer "
-            f"rejected or could not read the record on ranks {rejected}; its "
-            "warning names what differs, such as the FlashInfer, CUDA, cuBLAS "
-            f"or cuDNN version or the GPU. Delete {path.parent} to record the "
-            "tactics again."
-        )
-
-
 def _file_signature(path: Path) -> tuple[int, int, int] | None:
     try:
         stat = path.stat()
@@ -296,11 +185,10 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Results are persisted per rank under the configuration's hash, and a
     later start loads them when every rank has a matching file.
 
-    With ``KernelConfig.flashinfer_autotune_cache_mode == "replay"`` the files
-    are the record of the tactics, decided over the whole world group: when
-    no rank has a file, every rank tunes and saves; when every rank has one,
-    every rank loads it and this pass times nothing; anything else raises on
-    every rank.
+    With ``VLLM_FLASHINFER_AUTOTUNE_CACHE_ONLY`` set, every rank loads its
+    cache and the pass is skipped, and a cache that cannot be loaded on any
+    rank fails every rank; a start where no rank has a cache tunes and records
+    it, decided over the whole world group.
     """
     from flashinfer.autotuner import AutoTuner
 
@@ -318,24 +206,24 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     )
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
-    replay = runner.vllm_config.kernel_config.flashinfer_autotune_cache_mode == "replay"
-
-    tune_mode = True
-    if replay:
+    record = False
+    if envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_ONLY:
         states = _gather_from_group(_replay_cache_state(cache_path, world), world)
-        if _check_replay_cache_states(states, cache_path.parent, recorded=False):
-            _load_replay_cache(tuner, cache_path, world)
-            tune_mode = False
+        if not all(state.status == "missing" for state in states):
+            load_flashinfer_autotune_cache_only(cache_path, world)
             if is_leader:
-                logger.info(
-                    "Loaded FlashInfer autotune cache file %s in replay mode; "
-                    "no FlashInfer tactics were timed.",
-                    cache_path,
+                logger.info_once(
+                    "Loaded the FlashInfer autotune cache; skipping autotuning "
+                    "because VLLM_FLASHINFER_AUTOTUNE_CACHE_ONLY is set. Ops "
+                    "without a cached entry use FlashInfer's default tactic."
                 )
-        elif is_leader:
+            return
+        # No rank has a cache yet: this start records it.
+        record = True
+        if is_leader:
             logger.info(
-                "FlashInfer autotune cache mode is 'replay' and no cache file "
-                "exists; autotuning to record the tactics in %s.",
+                "VLLM_FLASHINFER_AUTOTUNE_CACHE_ONLY is set and no rank has a "
+                "FlashInfer autotune cache; autotuning to record it in %s.",
                 cache_path,
             )
     elif _all_ranks_have_matching_cache(cache_path, world):
@@ -343,7 +231,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         if not loaded:
             tuner.clear_cache()
 
-    with torch.inference_mode(), fi_utils.autotune(tune_mode=tune_mode):
+    with torch.inference_mode(), fi_utils.autotune():
         # Certain FlashInfer kernels (e.g. nvfp4 routed moe) are
         # incompatible with autotuning. This state is used to skip
         # those kernels during the autotuning process.
@@ -364,15 +252,25 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     if world.world_size > 1:
         world.barrier()
     # Skip the rewrite when nothing was tuned this start (every entry came from
-    # the file). A replay-mode start that records always saves, even with
-    # nothing tuned, so that the next start replays; one that loaded the record
-    # never does.
-    if tune_mode and (tuner._dirty or replay):
+    # the file). A start that records the cache always saves, even with
+    # nothing tuned, so that the next start loads it.
+    if tuner._dirty or record:
         before = _file_signature(cache_path)
         tuner.save_configs(str(cache_path))
         # Only a changed file counts as saved.
         if is_leader and _file_signature(cache_path) not in (None, before):
             logger.info("Saved FlashInfer autotune cache file %s.", cache_path)
-    if replay and tune_mode:
+    if record:
         states = _gather_from_group(_replay_cache_state(cache_path, world), world)
-        _check_replay_cache_states(states, cache_path.parent, recorded=True)
+        problems = [
+            f"rank {rank}: {state.status}"
+            for rank, state in enumerate(states)
+            if state.status != "present"
+        ]
+        if problems:
+            raise RuntimeError(
+                "VLLM_FLASHINFER_AUTOTUNE_CACHE_ONLY is set, but the FlashInfer "
+                "autotune cache this start recorded is not usable on every rank "
+                f"({', '.join(problems)}). Delete {cache_path.parent} to record "
+                "it again."
+            )

@@ -594,7 +594,9 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
         world.barrier()
     # Skip the rewrite when nothing was tuned this start (every entry came from
     # the file). FlashInfer gates its own autotune(cache=...) save the same way.
-    if tuner._dirty:
+    # A replay-mode start that records always saves, even with nothing tuned,
+    # so that the next start replays instead of recording again.
+    if tuner._dirty or (replay and tune_mode):
         tuner.save_configs(str(cache_path))
         if is_leader:
             logger.info("Saved FlashInfer autotune cache file %s.", cache_path)

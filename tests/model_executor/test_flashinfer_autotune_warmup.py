@@ -252,6 +252,7 @@ class _AutotuneRun:
         self.rank = 0
         self.tuning_group = None
         self.tune_mode = True
+        self.operations = ["shared_gemm"]
         self.autotune_modes: dict[int, list[bool]] = defaultdict(list)
         self.dummy_run_modes: dict[int, list[bool]] = defaultdict(list)
         self.collectives: dict[tuple[int, ...], dict[int, list[tuple[Any, ...]]]] = (
@@ -290,7 +291,8 @@ class _AutotuneRun:
 
     def dummy_runs(self, runner, *, skip_attn=False, tune_mode=True):
         self.dummy_run_modes[self.rank].append(tune_mode)
-        self.tuners[self.rank].profile("shared_gemm")
+        for operation in self.operations:
+            self.tuners[self.rank].profile(operation)
         if self.pp > 1 and self.rank // self.tp == 0:
             self.tuners[self.rank].profile("pp0_extra_gemm")
 
@@ -539,3 +541,25 @@ def test_replay_refuses_a_file_flashinfer_rejects(autotune_run, tp):
         replay.execute()
     assert not replay.profile_groups
     assert not replay.saves
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_replay_records_even_when_nothing_was_tuned(autotune_run, tp):
+    """An empty record still makes the next start replay, not record again."""
+    record = autotune_run(pp=1, tp=tp, cache_mode="replay")
+    record.operations = []
+    record.execute()
+    assert not record.profile_groups
+    assert [rank for rank, _, _ in record.saves] == list(range(tp))
+    replay = autotune_run(pp=1, tp=tp, cache_mode="replay")
+    replay.operations = []
+    replay.execute()
+    assert not replay.saves
+    assert dict(replay.autotune_modes) == {rank: [False] for rank in range(tp)}
+    # Negative control: tune mode saves nothing when nothing was tuned.
+    tune = autotune_run(pp=1, tp=tp)
+    tune.operations = []
+    for rank in range(tp):
+        tune.cache_path(rank).unlink()
+    tune.execute()
+    assert not tune.saves

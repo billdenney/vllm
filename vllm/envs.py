@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     S3_ENDPOINT_URL: str | None = None
     VLLM_MODEL_REDIRECT_PATH: str | None = None
     VLLM_CACHE_ROOT: str = os.path.expanduser("~/.cache/vllm")
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_CONFIG_ROOT: str = os.path.expanduser("~/.config/vllm")
     VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
     VLLM_NO_USAGE_STATS: bool = False
@@ -554,6 +555,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_CACHE_ROOT",
             os.path.join(get_default_cache_root(), "vllm"),
         )
+    ),
+    # Override the directory for the FlashInfer autotune config cache.
+    "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
     ),
     # used in distributed environment to determine the ip address
     # of the current node, when the node has multiple network interfaces.
@@ -1800,6 +1805,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",

@@ -215,6 +215,8 @@ LinearBackend = Literal[
     "xpu_woq",
 ]
 
+FlashInferAutotuneCacheMode = Literal["tune", "replay"]
+
 
 @config
 class KernelConfig:
@@ -228,6 +230,29 @@ class KernelConfig:
 
     enable_flashinfer_autotune: bool = None  # type: ignore[assignment]
     """If True, run FlashInfer autotuning during kernel warmup."""
+
+    flashinfer_autotune_cache_mode: FlashInferAutotuneCacheMode = "tune"
+    """How FlashInfer autotuning uses its persistent cache of tactics (under
+    `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, else the vLLM cache root). Has no
+    effect when FlashInfer autotuning is disabled. Available options:
+
+    - "tune": Load the cached tactics when every rank of the tuning group has a
+      matching file, autotune any shape they do not cover, and save the result.
+      A cache file that cannot be loaded is ignored and tuning starts over.
+    - "replay": Treat the cache as the record of the tactics, so that a restart
+      selects the same kernels as the start that wrote it. When no rank has a
+      file, the start autotunes as in "tune" mode and saves the tactics. When
+      every rank has one, they are loaded and the autotuning pass times
+      nothing; a shape they do not cover uses FlashInfer's fallback tactic.
+      A file that is unreadable, malformed, missing on some ranks,
+      inconsistent within a tuning group or rejected by FlashInfer (for
+      example, written with another FlashInfer, CUDA, cuBLAS or cuDNN version
+      or on another GPU) is an error: tuning the ranks that lack a usable file
+      would re-tune silently and rewrite the record. The mode governs the
+      warmup's FlashInfer autotuning pass only; warmup steps with their own
+      FlashInfer cache (the SM120 sparse-MLA decode warmup, the PCIe
+      all-reduce warmup) still time their kernels.
+    """
 
     # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
     # to the shared JIT warmup infrastructure.
@@ -356,6 +381,9 @@ class KernelConfig:
             "enable_cutedsl_warmup",
             "enable_jit_warmup",
             "enable_flashinfer_autotune",
+            # Must not change the FlashInfer autotune cache key, which hashes
+            # this config: replay has to find the file a tune-mode start wrote.
+            "flashinfer_autotune_cache_mode",
             "ir_op_priority",  # handled separately below
         }
         if self.linear_backend_per_quant is None:

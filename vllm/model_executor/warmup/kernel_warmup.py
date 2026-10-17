@@ -395,13 +395,18 @@ def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
     return json.dumps(metadata, sort_keys=True), len(configs)
 
 
+def _gather_from_group(obj, group) -> list:
+    if group.world_size == 1:
+        return [obj]
+    gathered: list = [None] * group.world_size
+    torch.distributed.all_gather_object(gathered, obj, group=group.cpu_group)
+    return gathered
+
+
 def _all_ranks_have_matching_cache(path: Path, group) -> bool:
     """True iff every rank in ``group`` has its own, mutually consistent file."""
     fingerprint = _autotune_cache_fingerprint(path)
-    if group.world_size == 1:
-        return fingerprint is not None
-    gathered: list[tuple[str, int] | None] = [None] * group.world_size
-    torch.distributed.all_gather_object(gathered, fingerprint, group=group.cpu_group)
+    gathered = _gather_from_group(fingerprint, group)
     return fingerprint is not None and all(f == fingerprint for f in gathered)
 
 
@@ -419,14 +424,6 @@ def _replay_cache_state(path: Path) -> _ReplayCacheState:
     if fingerprint is None:
         return _ReplayCacheState("malformed", None)
     return _ReplayCacheState("present", fingerprint)
-
-
-def _gather_from_group(obj, group) -> list:
-    if group.world_size == 1:
-        return [obj]
-    gathered: list = [None] * group.world_size
-    torch.distributed.all_gather_object(gathered, obj, group=group.cpu_group)
-    return gathered
 
 
 def _load_flashinfer_autotune_replay_cache(tuner, path: Path, group) -> bool:
@@ -557,13 +554,9 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 cache_path,
             )
     elif _all_ranks_have_matching_cache(cache_path, tune_group):
-        loaded = tuner.load_configs(str(cache_path))
-        if tune_group.world_size > 1:
-            loaded_by_rank: list[bool | None] = [None] * tune_group.world_size
-            torch.distributed.all_gather_object(
-                loaded_by_rank, loaded, group=tune_group.cpu_group
-            )
-            loaded = all(loaded_by_rank)
+        loaded = all(
+            _gather_from_group(tuner.load_configs(str(cache_path)), tune_group)
+        )
         if not loaded:
             tuner.clear_cache()
 

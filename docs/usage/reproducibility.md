@@ -30,13 +30,21 @@ else under `VLLM_CACHE_ROOT`), but by default it still times any shape the cache
 does not cover and tunes again when a cache file cannot be loaded.
 
 With `--flashinfer-autotune-cache-mode replay`, the cache becomes the record of
-the tactics: the first start (no cache file yet) tunes and saves them, and every
-later start with the same configuration loads them and times nothing. A cache
-file that is malformed, inconsistent across ranks, or rejected by FlashInfer
-(for example, written with another FlashInfer, CUDA, cuBLAS or cuDNN version or
-on another GPU) stops the start instead of being re-tuned silently. Keep the
-cache directory on persistent storage, such as a volume in a container
-deployment, and delete it to record the tactics again.
+the tactics: the first start (no cache file on any rank) tunes and saves them,
+and every later start with the same configuration loads them and times nothing
+in the autotuning pass. A cache file that is unreadable, malformed, missing on
+some ranks, inconsistent across the ranks of a tuning group, or rejected by
+FlashInfer (for example, written with another FlashInfer, CUDA, cuBLAS or cuDNN
+version or on another GPU) stops the start instead of being re-tuned silently,
+which would rewrite the record. Keep the cache directory on persistent storage,
+such as a volume in a container deployment, and delete it to record the tactics
+again. Record once on one instance before scaling out, so that every instance
+loads the same record; [`vllm preload`](../features/preload.md) can make it.
+
+Replay governs the warmup's FlashInfer autotuning pass. Warmup steps that keep
+their own FlashInfer cache, such as the SM120 sparse-MLA decode warmup and the
+PCIe all-reduce warmup, still time their kernels, as do torch.compile and
+Triton autotuning.
 
 ## Setting the global seed
 

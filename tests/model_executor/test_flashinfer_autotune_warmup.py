@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
+import re
 import sys
+import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from inspect import signature
@@ -182,15 +185,6 @@ class _AutotuneGroup:
     def all_gather_object(self, out, obj):
         # Ranks run sequentially: snapshot every rank's file before any saves.
         self.record(("all_gather",))
-        if isinstance(obj, warmup._ReplayCacheState):
-            out[:] = self.run.gathered.setdefault(
-                ("replay", self.ranks),
-                [
-                    warmup._replay_cache_state(self.run.cache_path(rank))
-                    for rank in self.ranks
-                ],
-            )
-            return
         if isinstance(obj, bool):
             out[:] = [rank not in self.run.rejected_load_ranks for rank in self.ranks]
             assert out[self.rank_in_group] == obj
@@ -252,9 +246,7 @@ class _AutotuneRun:
         self.rank = 0
         self.tuning_group = None
         self.tune_mode = True
-        self.operations = ["shared_gemm"]
         self.autotune_modes: dict[int, list[bool]] = defaultdict(list)
-        self.dummy_run_modes: dict[int, list[bool]] = defaultdict(list)
         self.collectives: dict[tuple[int, ...], dict[int, list[tuple[Any, ...]]]] = (
             defaultdict(lambda: defaultdict(list))
         )
@@ -290,9 +282,7 @@ class _AutotuneRun:
             self.tune_mode = True
 
     def dummy_runs(self, runner, *, skip_attn=False, tune_mode=True):
-        self.dummy_run_modes[self.rank].append(tune_mode)
-        for operation in self.operations:
-            self.tuners[self.rank].profile(operation)
+        self.tuners[self.rank].profile("shared_gemm")
         if self.pp > 1 and self.rank // self.tp == 0:
             self.tuners[self.rank].profile("pp0_extra_gemm")
 
@@ -358,6 +348,7 @@ def autotune_run(monkeypatch, tmp_path):
 def test_heterogeneous_pp_stages_have_compatible_collectives(autotune_run, tp):
     run = autotune_run(tp=tp).execute()
     run.assert_collectives_match()
+    assert dict(run.autotune_modes) == {rank: [True] for rank in range(2 * tp)}
     for rank, groups in run.profile_groups.items():
         expected = tuple(range(rank // tp * tp, (rank // tp + 1) * tp))
         assert groups and all(
@@ -380,6 +371,8 @@ def test_pp_stage_cache_roundtrip_isolated_and_asymmetric_hits_safe(
     warm = autotune_run().execute()
     warm.assert_collectives_match()
     assert not warm.profile_groups and not warm.saves
+    # Tune mode still enters autotune(tune_mode=True) with every entry loaded.
+    assert dict(warm.autotune_modes) == {rank: [True] for rank in range(8)}
     for rank, tuner in warm.tuners.items():
         assert tuner.loaded == stage_caches[rank // 4]
     cold.cache_path(5).unlink()
@@ -393,6 +386,7 @@ def test_pp_stage_cache_roundtrip_isolated_and_asymmetric_hits_safe(
 def test_pp1_tunes_world_group_and_saves_per_rank(autotune_run):
     run = autotune_run(pp=1, tp=4).execute()
     run.assert_collectives_match()
+    assert dict(run.autotune_modes) == {rank: [True] for rank in range(4)}
     assert [(rank, path) for rank, path, _ in run.saves] == [
         (rank, run.cache_path(rank)) for rank in range(4)
     ]
@@ -455,6 +449,8 @@ def test_autotune_cache_key_normalizes_kv_init_fields():
 
 def test_cache_mode_defaults_to_tune_and_is_outside_the_cache_key():
     """Replay must find the file a tune-mode start wrote under the same key."""
+    from pydantic import ValidationError
+
     from vllm.config.kernel import KernelConfig
 
     assert KernelConfig().flashinfer_autotune_cache_mode == "tune"
@@ -464,102 +460,434 @@ def test_cache_mode_defaults_to_tune_and_is_outside_the_cache_key():
     assert KernelConfig(moe_backend="triton").compute_hash() != (
         KernelConfig().compute_hash()
     )
+    with pytest.raises(ValidationError):
+        KernelConfig(flashinfer_autotune_cache_mode="record")
+
+
+def test_flashinfer_saves_and_loads_an_empty_record(tmp_path):
+    """The record of a model with nothing to tune is FlashInfer's own file."""
+    autotuner = pytest.importorskip("flashinfer.autotuner")
+    # Inner autotune() calls rely on tuning being the default.
+    assert signature(autotuner.autotune).parameters["tune_mode"].default is True
+    tuner = autotuner.AutoTuner()
+    path = tmp_path / "autotune_configs_dp0_rank0.json"
+    tuner.save_configs(str(path))
+    assert "_metadata" in json.loads(path.read_text())
+    assert tuner.load_configs(str(path)) is True
+    assert warmup._autotune_cache_fingerprint(path) is not None
+    # Negative control: a record from another GPU is rejected.
+    record = json.loads(path.read_text())
+    record["_metadata"]["gpu"] = "Another GPU"
+    path.write_text(json.dumps(record))
+    assert tuner.load_configs(str(path)) is False
+
+
+class _ThreadedGroup:
+    """A process group of rank threads: a collective waits for every member,
+    so a rank that skips one breaks the barrier instead of passing."""
+
+    def __init__(self, cluster, ranks):
+        self.cluster = cluster
+        self.ranks = tuple(ranks)
+        self.world_size = len(self.ranks)
+        self.cpu_group = self
+        self._barrier = threading.Barrier(self.world_size, timeout=10)
+        self._lock = threading.Lock()
+        self._calls: dict[int, int] = defaultdict(int)
+        self._slots: dict[int, list] = {}
+
+    @property
+    def rank_in_group(self):
+        return self.ranks.index(self.cluster.rank)
+
+    def all_gather_object(self, out, obj):
+        rank = self.cluster.rank
+        with self._lock:
+            index = self._calls[rank]
+            self._calls[rank] += 1
+            slot = self._slots.setdefault(index, [None] * self.world_size)
+            slot[self.ranks.index(rank)] = obj
+        self.cluster.trace(self.ranks, ("all_gather", index))
+        self._barrier.wait()
+        out[:] = list(self._slots[index])
+
+    def barrier(self):
+        self.cluster.trace(self.ranks, ("barrier",))
+        self._barrier.wait()
+
+
+class _ThreadedTuner:
+    """FlashInfer's AutoTuner for one rank: a record holds the environment it
+    was written in, and loading it in another is refused, as FlashInfer does."""
+
+    def __init__(self, cluster, rank):
+        self.cluster = cluster
+        self.rank = rank
+        self.cache: dict[str, int] = {}
+        self.loaded = None
+        self._dirty = cluster.dirty_before
+
+    def load_configs(self, path):
+        if self.rank in self.cluster.vanishing_ranks:
+            raise FileNotFoundError(path)
+        configs = json.loads(Path(path).read_text())
+        if configs.pop("_metadata", None) != self.cluster.environment:
+            return False
+        self.loaded = configs
+        self.cache.update(configs)
+        return True
+
+    def save_configs(self, path):
+        if self.rank in self.cluster.unwritten_ranks:
+            return
+        extra = {"odd_gemm": 0} if self.rank in self.cluster.odd_save_ranks else {}
+        record = {"_metadata": self.cluster.environment, **self.cache, **extra}
+        partial = Path(f"{path}.partial")
+        partial.write_text(json.dumps(record))
+        os.replace(partial, path)
+        self.cluster.saves[self.rank] = dict(self.cache)
+        self._dirty = False
+
+    def profile(self, operation):
+        # Outside tuning mode FlashInfer takes the fallback tactic of a miss.
+        if operation in self.cache or not self.cluster.local.tune_mode:
+            return
+        self.cluster.profiled[self.rank].append(operation)
+        self.cache[operation] = self.rank // self.cluster.tp
+        self._dirty = True
+
+
+class _ReplayCluster:
+    """pp x tp ranks, each running flashinfer_autotune() in its own thread in
+    replay mode, against the files in `cache_dir`."""
+
+    def __init__(self, pp, tp, cache_dir):
+        self.pp, self.tp = pp, tp
+        self.cache_dir = cache_dir
+        self.ranks = range(pp * tp)
+        self.local = threading.local()
+        self.world_group = _ThreadedGroup(self, self.ranks)
+        self.tp_groups = [
+            _ThreadedGroup(self, range(stage * tp, (stage + 1) * tp))
+            for stage in range(pp)
+        ]
+        self.environment = {"flashinfer_version": "test", "gpu": "Test GPU"}
+        self.operations = ["shared_gemm"]
+        self.dirty_before = False
+        self.vanishing_ranks: set[int] = set()
+        self.unwritten_ranks: set[int] = set()
+        self.odd_save_ranks: set[int] = set()
+        self.tuners: dict[int, _ThreadedTuner] = {}
+        self.autotune_modes: dict[int, list[bool]] = defaultdict(list)
+        self.dummy_run_modes: dict[int, list[bool]] = defaultdict(list)
+        self.profiled: dict[int, list[str]] = defaultdict(list)
+        self.saves: dict[int, dict[str, int]] = {}
+        self.errors: dict[int, str] = {}
+        self.traces: dict[tuple[int, ...], dict[int, list]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        self._trace_lock = threading.Lock()
+
+    @property
+    def rank(self):
+        return self.local.rank
+
+    def cache_path(self, rank):
+        return self.cache_dir / f"autotune_configs_dp0_rank{rank}.json"
+
+    def tensor_group(self):
+        return self.tp_groups[self.rank // self.tp]
+
+    def trace(self, ranks, operation):
+        with self._trace_lock:
+            self.traces[ranks][self.rank].append(operation)
+
+    @contextmanager
+    def autotune(self, *, tune_mode=True, **kwargs):
+        self.autotune_modes[self.rank].append(tune_mode)
+        self.local.tune_mode = tune_mode
+        try:
+            yield
+        finally:
+            self.local.tune_mode = True
+
+    def dummy_runs(self, runner, *, skip_attn=False, tune_mode=True):
+        self.dummy_run_modes[self.rank].append(tune_mode)
+        tuner = self.tuners[self.rank]
+        for operation in self.operations:
+            tuner.profile(operation)
+        if self.pp > 1 and self.rank // self.tp == 0:
+            tuner.profile("pp0_extra_gemm")
+
+    def _run_rank(self, rank):
+        self.local.rank = rank
+        self.local.tune_mode = True
+        try:
+            flashinfer_autotune(_make_runner([], cache_mode="replay"))
+        except Exception as error:
+            self.errors[rank] = f"{type(error).__name__}: {error}"
+
+    def execute(self):
+        self.tuners = {rank: _ThreadedTuner(self, rank) for rank in self.ranks}
+        threads = [
+            threading.Thread(target=self._run_rank, args=(rank,)) for rank in self.ranks
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads)
+        return self
+
+    def assert_collectives_match(self):
+        for ranks, traces in self.traces.items():
+            assert set(traces) == set(ranks)
+            expected = traces[ranks[0]]
+            assert all(trace == expected for trace in traces.values()), dict(traces)
+
+    def assert_every_rank_raised(self, match):
+        """Every rank raised the same RuntimeError, after the same collectives."""
+        assert set(self.errors) == set(self.ranks), self.errors
+        messages = set(self.errors.values())
+        assert len(messages) == 1, messages
+        assert re.search(match, messages.pop())
+        self.assert_collectives_match()
+        assert not self.profiled
+
+
+@pytest.fixture
+def replay_cluster(monkeypatch, tmp_path):
+    import vllm.utils.flashinfer as fi_utils
+    from vllm.distributed import parallel_state
+
+    clusters: list[_ReplayCluster] = []
+
+    def current():
+        return clusters[-1]
+
+    autotuner = ModuleType("flashinfer.autotuner")
+    monkeypatch.setattr(
+        autotuner,
+        "AutoTuner",
+        SimpleNamespace(get=lambda: current().tuners[current().rank]),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        autotuner, "set_autotune_process_group", lambda group: None, raising=False
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", autotuner)
+    monkeypatch.setattr(
+        parallel_state, "get_world_group", lambda: current().world_group
+    )
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group", lambda: current().tensor_group()
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=current().pp),
+    )
+    monkeypatch.setattr(
+        fi_utils, "autotune", lambda **kwargs: current().autotune(**kwargs)
+    )
+    monkeypatch.setattr(
+        "torch.distributed.all_gather_object",
+        lambda out, obj, group: group.all_gather_object(out, obj),
+    )
+    monkeypatch.setattr(
+        warmup,
+        "resolve_flashinfer_autotune_file",
+        lambda runner: tmp_path / "autotune_configs.json",
+    )
+    monkeypatch.setattr(warmup, "_flashinfer_autotune_skip_ops", lambda runner: None)
+    monkeypatch.setattr(
+        warmup,
+        "_run_flashinfer_autotune_dummy_runs",
+        lambda runner, **kwargs: current().dummy_runs(runner, **kwargs),
+    )
+    monkeypatch.setattr(warmup, "replayssm_autotune_warmup", lambda runner: None)
+    monkeypatch.setattr(warmup, "_autotune_kimi_k3_kda_qkvg", lambda model: None)
+
+    def make(*, pp=1, tp=1):
+        clusters.append(_ReplayCluster(pp, tp, tmp_path))
+        return clusters[-1]
+
+    return make
+
+
+def _log_lines(caplog, prefix):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
 
 
 @pytest.mark.parametrize("pp, tp", [(1, 1), (1, 4), (2, 4)])
-def test_replay_records_once_then_loads_without_timing(autotune_run, pp, tp):
+def test_replay_records_once_then_loads_without_timing(
+    replay_cluster, caplog_vllm, pp, tp
+):
     ranks = range(pp * tp)
-    record = autotune_run(pp=pp, tp=tp, cache_mode="replay").execute()
+    leaders = [stage * tp for stage in range(pp)]
+    record = replay_cluster(pp=pp, tp=tp).execute()
+    assert record.errors == {}
     record.assert_collectives_match()
-    saved = {rank: cache for rank, _, cache in record.saves}
-    assert set(saved) == set(ranks)
+    assert set(record.saves) == set(ranks)
     assert dict(record.autotune_modes) == {rank: [True] for rank in ranks}
     assert dict(record.dummy_run_modes) == {rank: [True] for rank in ranks}
+    paths = [record.cache_path(rank) for rank in leaders]
+    assert sorted(_log_lines(caplog_vllm, "Saved FlashInfer")) == sorted(
+        f"Saved FlashInfer autotune cache file {path}." for path in paths
+    )
+    assert sorted(_log_lines(caplog_vllm, "FlashInfer autotune cache mode")) == sorted(
+        "FlashInfer autotune cache mode is 'replay' and no cache file exists; "
+        f"autotuning to record the tactics in {path}."
+        for path in paths
+    )
+    caplog_vllm.clear()
 
-    replay = autotune_run(pp=pp, tp=tp, cache_mode="replay").execute()
+    replay = replay_cluster(pp=pp, tp=tp).execute()
+    assert replay.errors == {}
     replay.assert_collectives_match()
-    assert not replay.profile_groups
+    assert not replay.profiled
     assert not replay.saves
     assert dict(replay.autotune_modes) == {rank: [False] for rank in ranks}
     assert dict(replay.dummy_run_modes) == {rank: [False] for rank in ranks}
-    assert {rank: tuner.loaded for rank, tuner in replay.tuners.items()} == saved
+    assert {rank: tuner.loaded for rank, tuner in replay.tuners.items()} == (
+        record.saves
+    )
+    assert sorted(_log_lines(caplog_vllm, "Loaded FlashInfer")) == sorted(
+        f"Loaded FlashInfer autotune cache file {path} in replay mode; "
+        "no FlashInfer tactics were timed."
+        for path in paths
+    )
+    assert _log_lines(caplog_vllm, "Saved FlashInfer") == []
 
 
-def test_replay_does_not_time_shapes_missing_from_the_file(autotune_run):
-    replay = autotune_run(pp=1, tp=1, cache_mode="replay")
-    replay.cache_path(0).write_text("{}")
-    replay.execute()
-    assert replay.tuners[0].loaded == {}
-    assert not replay.profile_groups
-    assert not replay.saves
-    # Negative control: tune mode times the same miss and saves it.
-    tune = autotune_run(pp=1, tp=1).execute()
-    assert dict(tune.profile_groups) == {0: [None]}
-    assert [rank for rank, _, _ in tune.saves] == [0]
-
-
-@pytest.mark.parametrize("tp", [1, 4])
-def test_replay_refuses_a_malformed_file(autotune_run, tp):
-    autotune_run(pp=1, tp=tp, cache_mode="replay").execute()
-    replay = autotune_run(pp=1, tp=tp, cache_mode="replay")
-    replay.cache_path(tp - 1).write_text("{not json")
-    with pytest.raises(RuntimeError, match=rf"rank {tp - 1}: malformed"):
-        replay.execute()
-    assert not replay.profile_groups
-    assert not replay.saves
-
-
-def test_replay_refuses_files_missing_on_some_ranks(autotune_run):
-    autotune_run(pp=1, tp=4, cache_mode="replay").execute()
-    replay = autotune_run(pp=1, tp=4, cache_mode="replay")
-    replay.cache_path(2).unlink()
-    with pytest.raises(RuntimeError, match=r"\(rank 2: missing;"):
-        replay.execute()
-    assert not replay.profile_groups
-    assert not replay.saves
-
-
-def test_replay_refuses_files_that_differ_across_ranks(autotune_run):
-    autotune_run(pp=1, tp=4, cache_mode="replay").execute()
-    replay = autotune_run(pp=1, tp=4, cache_mode="replay")
-    stale = replay.cache_path(1)
-    stale.write_text(json.dumps({**json.loads(stale.read_text()), "old_gemm": 0}))
-    with pytest.raises(RuntimeError, match="differ across the ranks"):
-        replay.execute()
-    assert not replay.profile_groups
-    assert not replay.saves
-
-
-@pytest.mark.parametrize("tp", [1, 4])
-def test_replay_refuses_a_file_flashinfer_rejects(autotune_run, tp):
-    autotune_run(pp=1, tp=tp, cache_mode="replay").execute()
-    replay = autotune_run(pp=1, tp=tp, cache_mode="replay")
-    replay.rejected_load_ranks = {tp - 1}
-    with pytest.raises(
-        RuntimeError, match=rf"rejected the cache file on ranks \[{tp - 1}\]"
-    ):
-        replay.execute()
-    assert not replay.profile_groups
-    assert not replay.saves
-
-
-@pytest.mark.parametrize("tp", [1, 4])
-def test_replay_records_even_when_nothing_was_tuned(autotune_run, tp):
-    """An empty record still makes the next start replay, not record again."""
-    record = autotune_run(pp=1, tp=tp, cache_mode="replay")
+def test_replay_does_not_time_shapes_missing_from_the_record(replay_cluster):
+    record = replay_cluster()
     record.operations = []
     record.execute()
-    assert not record.profile_groups
-    assert [rank for rank, _, _ in record.saves] == list(range(tp))
-    replay = autotune_run(pp=1, tp=tp, cache_mode="replay")
+    assert record.errors == {}
+    assert record.saves == {0: {}}
+    replay = replay_cluster()
+    replay.operations = ["shared_gemm", "new_gemm"]
+    replay.execute()
+    assert replay.errors == {}
+    assert not replay.profiled
+    assert not replay.saves
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_replay_records_even_when_nothing_was_tuned(replay_cluster, tp):
+    """An empty record still makes the next start replay, not record again."""
+    record = replay_cluster(tp=tp)
+    record.operations = []
+    record.execute()
+    assert record.errors == {}
+    assert not record.profiled
+    assert set(record.saves) == set(range(tp))
+    replay = replay_cluster(tp=tp)
     replay.operations = []
     replay.execute()
+    assert replay.errors == {}
     assert not replay.saves
     assert dict(replay.autotune_modes) == {rank: [False] for rank in range(tp)}
-    # Negative control: tune mode saves nothing when nothing was tuned.
-    tune = autotune_run(pp=1, tp=tp)
-    tune.operations = []
-    for rank in range(tp):
-        tune.cache_path(rank).unlink()
-    tune.execute()
-    assert not tune.saves
+
+
+def test_replay_that_loaded_never_rewrites_the_record(replay_cluster):
+    """An earlier warmup step that leaves the tuner dirty does not get its
+    tactics written into a record replay loaded."""
+    replay_cluster(tp=2).execute()
+    replay = replay_cluster(tp=2)
+    replay.dirty_before = True
+    replay.execute()
+    assert replay.errors == {}
+    assert not replay.saves
+
+
+def _break_one(cluster, rank, how):
+    path = cluster.cache_path(rank)
+    if how == "malformed":
+        path.write_text("{not json")
+    elif how == "missing":
+        path.unlink()
+    elif how == "unreadable":
+        path.unlink()
+        path.mkdir()
+    elif how == "different":
+        path.write_text(json.dumps({**json.loads(path.read_text()), "old_gemm": 0}))
+
+
+@pytest.mark.parametrize(
+    "how, match",
+    [
+        ("malformed", r"\(rank 3: malformed\)"),
+        ("missing", r"\(rank 3: missing\)"),
+        ("unreadable", r"\(rank 3: unreadable\)"),
+        ("different", r"differs across the ranks of tuning groups \[\(0, 1, 2, 3\)\]"),
+    ],
+)
+def test_replay_refuses_a_record_that_is_not_whole_on_every_rank(
+    replay_cluster, tmp_path, how, match
+):
+    replay_cluster(tp=4).execute()
+    replay = replay_cluster(tp=4)
+    _break_one(replay, 3, how)
+    replay.execute()
+    replay.assert_every_rank_raised(match)
+    assert f"Delete {tmp_path} to record the tactics again." in replay.errors[0]
+    assert not replay.saves
+
+
+def test_replay_decides_over_every_pipeline_stage(replay_cluster):
+    """One stage whose files are gone does not record while the other replays."""
+    replay_cluster(pp=2, tp=2).execute()
+    replay = replay_cluster(pp=2, tp=2)
+    for rank in (2, 3):
+        replay.cache_path(rank).unlink()
+    replay.execute()
+    replay.assert_every_rank_raised(r"\(rank 2: missing, rank 3: missing\)")
+    assert not replay.saves
+    # The stages' records differ in what they hold, which is not a mismatch.
+    for rank in (2, 3):
+        replay.cache_path(rank).write_text(
+            json.dumps({"_metadata": replay.environment, "shared_gemm": 1})
+        )
+    again = replay_cluster(pp=2, tp=2).execute()
+    assert again.errors == {}
+
+
+def test_replay_refuses_a_record_flashinfer_rejects_or_cannot_read(replay_cluster):
+    replay_cluster(tp=4).execute()
+    other_gpu = replay_cluster(tp=4)
+    other_gpu.environment = {"flashinfer_version": "test", "gpu": "Another GPU"}
+    other_gpu.execute()
+    other_gpu.assert_every_rank_raised(
+        r"rejected or could not read the record on ranks \[0, 1, 2, 3\]"
+    )
+    vanished = replay_cluster(tp=4)
+    vanished.vanishing_ranks = {2}
+    vanished.execute()
+    vanished.assert_every_rank_raised(
+        r"rejected or could not read the record on ranks \[2\]"
+    )
+
+
+def test_replay_checks_the_record_it_saved(replay_cluster):
+    unwritten = replay_cluster(tp=2)
+    unwritten.unwritten_ranks = {1}
+    unwritten.execute()
+    assert set(unwritten.errors) == {0, 1}
+    assert len(set(unwritten.errors.values())) == 1
+    assert (
+        "the record this start saved is not usable on every rank (rank 1: missing)"
+        in (unwritten.errors[0])
+    )
+    unwritten.assert_collectives_match()
+    for path in unwritten.cache_dir.glob("autotune_configs_*.json"):
+        path.unlink()
+    odd = replay_cluster(tp=2)
+    odd.odd_save_ranks = {1}
+    odd.execute()
+    assert set(odd.errors) == {0, 1}
+    assert (
+        "the record this start saved differs across the ranks of tuning groups"
+        in (odd.errors[1])
+    )

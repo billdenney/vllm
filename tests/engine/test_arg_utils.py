@@ -835,6 +835,10 @@ def test_flashinfer_autotune_cache_mode_rejects_unknown_modes():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
     with pytest.raises(ArgumentError):
         parser.parse_args(["--flashinfer-autotune-cache-mode", "record"])
+    with pytest.raises(ArgumentError, match="flashinfer_autotune_cache_mode"):
+        parser.parse_args(
+            ["--kernel-config", '{"flashinfer_autotune_cache_mode": "record"}']
+        )
 
 
 def test_flashinfer_autotune_cache_mode_reaches_kernel_config():

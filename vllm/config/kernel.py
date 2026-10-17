@@ -266,6 +266,8 @@ LinearBackend = Literal[
     "xpu_woq",
 ]
 
+FlashInferAutotuneCacheMode = Literal["tune", "replay"]
+
 
 @config
 class KernelConfig:
@@ -279,6 +281,24 @@ class KernelConfig:
 
     enable_flashinfer_autotune: bool = None  # type: ignore[assignment]
     """If True, run FlashInfer autotuning during kernel warmup."""
+
+    flashinfer_autotune_cache_mode: FlashInferAutotuneCacheMode = "tune"
+    """How FlashInfer autotuning uses its persistent cache of tactics (under
+    `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, else the vLLM cache root). Has no
+    effect when FlashInfer autotuning is disabled. Available options:
+
+    - "tune": Load the cached tactics when every rank of the tuning group has a
+      matching file, autotune any shape they do not cover, and save the result.
+      A cache file that cannot be loaded is ignored and tuning starts over.
+    - "replay": Treat the cache as the record of the tactics, so that a restart
+      selects the same kernels as the start that wrote it. When the cache files
+      exist, they are loaded and no tactic is timed; a shape they do not cover
+      uses FlashInfer's fallback tactic. A file that is malformed, missing on
+      some ranks, inconsistent across ranks or rejected by FlashInfer (for
+      example, written with another FlashInfer, CUDA, cuBLAS or cuDNN version
+      or on another GPU) is an error. When no rank has a file, the start
+      autotunes as in "tune" mode and saves the tactics for the next start.
+    """
 
     enable_rocm_segmented_attn_autotune: bool = False
     """If True, autotune ROCm segmented attention during kernel warmup on RDNA GPUs."""
@@ -422,6 +442,9 @@ class KernelConfig:
             "enable_cutedsl_warmup",
             "enable_jit_warmup",
             "enable_flashinfer_autotune",
+            # Must not change the FlashInfer autotune cache key, which hashes
+            # this config: replay has to find the file a tune-mode start wrote.
+            "flashinfer_autotune_cache_mode",
             "enable_rocm_segmented_attn_autotune",
             "ir_op_priority",  # handled separately below
         }

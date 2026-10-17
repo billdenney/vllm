@@ -9,7 +9,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -340,7 +340,7 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
 
 
 def _run_flashinfer_autotune_dummy_runs(
-    runner: "GPUModelRunner", *, skip_attn: bool = False
+    runner: "GPUModelRunner", *, skip_attn: bool = False, tune_mode: bool = True
 ) -> None:
     import vllm.utils.flashinfer as fi_utils
 
@@ -371,7 +371,11 @@ def _run_flashinfer_autotune_dummy_runs(
         )
         # Round M up to match serving-time bucket selection for non-bucket M.
         # See https://github.com/flashinfer-ai/flashinfer/issues/5450
-        with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):
+        # tune_mode is passed through: an inner autotune(True) would time
+        # tactics even inside an outer autotune(False).
+        with fi_utils.autotune(
+            tune_mode=tune_mode, tuning_buckets=tuning_buckets, round_up=True
+        ):
             runner._dummy_run(
                 num_tokens=num_tokens,
                 skip_eplb=True,
@@ -401,6 +405,73 @@ def _all_ranks_have_matching_cache(path: Path, group) -> bool:
     return fingerprint is not None and all(f == fingerprint for f in gathered)
 
 
+class _ReplayCacheState(NamedTuple):
+    """One rank's autotune cache file, as replay mode sees it."""
+
+    status: str  # "missing", "malformed" or "present"
+    fingerprint: tuple[str, int] | None
+
+
+def _replay_cache_state(path: Path) -> _ReplayCacheState:
+    if not path.exists():
+        return _ReplayCacheState("missing", None)
+    fingerprint = _autotune_cache_fingerprint(path)
+    if fingerprint is None:
+        return _ReplayCacheState("malformed", None)
+    return _ReplayCacheState("present", fingerprint)
+
+
+def _gather_from_group(obj, group) -> list:
+    if group.world_size == 1:
+        return [obj]
+    gathered: list = [None] * group.world_size
+    torch.distributed.all_gather_object(gathered, obj, group=group.cpu_group)
+    return gathered
+
+
+def _load_flashinfer_autotune_replay_cache(tuner, path: Path, group) -> bool:
+    """Load the replay-mode cache on every rank of ``group``.
+
+    Returns False when no rank has a file, which makes this start the one that
+    records the tactics, and True when every rank loaded its file. Anything
+    else raises on every rank, after the ranks have exchanged their states, so
+    that no rank is left waiting in a collective: replay never falls back to
+    tuning, since the tactics tuning picks depend on timing.
+    """
+    states = _gather_from_group(_replay_cache_state(path), group)
+    if all(state.status == "missing" for state in states):
+        return False
+    problems = [
+        f"rank {rank}: {state.status}"
+        for rank, state in enumerate(states)
+        if state.status != "present"
+    ]
+    if problems:
+        raise RuntimeError(
+            "FlashInfer autotune cache mode is 'replay', but the cache files "
+            f"are not usable on every rank ({', '.join(problems)}; this rank's "
+            f"file is {path}). Delete the cache directory to record the "
+            "tactics again."
+        )
+    if len({state.fingerprint for state in states}) > 1:
+        raise RuntimeError(
+            "FlashInfer autotune cache mode is 'replay', but the cache files "
+            f"differ across the ranks of the tuning group (this rank's file is "
+            f"{path}). Delete the cache directory to record the tactics again."
+        )
+    loaded = _gather_from_group(tuner.load_configs(str(path)), group)
+    rejected = [rank for rank, ok in enumerate(loaded) if not ok]
+    if rejected:
+        raise RuntimeError(
+            "FlashInfer autotune cache mode is 'replay', but FlashInfer "
+            f"rejected the cache file on ranks {rejected} (this rank's file is "
+            f"{path}); its warning names the metadata that differs, such as the "
+            "FlashInfer, CUDA, cuBLAS or cuDNN version or the GPU. Delete the "
+            "cache directory to record the tactics again."
+        )
+    return True
+
+
 def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) -> None:
     """Autotune FlashInfer operations.
     FlashInfer have many implementations for the same operation,
@@ -424,6 +495,10 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     rank. A rank with a cache hit skips the per-tactic reduce the others block
     in, so ranks keep loaded configs only if every rank in the tuning group
     has a matching file and successfully loads it.
+
+    With ``KernelConfig.flashinfer_autotune_cache_mode == "replay"`` the
+    loaded files are authoritative: nothing is timed, a file that cannot be
+    loaded is an error, and only a start without any file tunes (and saves).
 
     """
     from flashinfer.autotuner import AutoTuner, set_autotune_process_group
@@ -458,13 +533,30 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     )
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
+    replay = runner.vllm_config.kernel_config.flashinfer_autotune_cache_mode == "replay"
 
     # We skip EPLB here since we don't want to record dummy metrics.
     # Randomize inputs to avoid every token pick the same experts,
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
-    if _all_ranks_have_matching_cache(cache_path, tune_group):
+    tune_mode = True
+    if replay:
+        if _load_flashinfer_autotune_replay_cache(tuner, cache_path, tune_group):
+            tune_mode = False
+            if is_leader:
+                logger.info(
+                    "Loaded FlashInfer autotune cache file %s in replay mode; "
+                    "no autotuning ran.",
+                    cache_path,
+                )
+        elif is_leader:
+            logger.info(
+                "FlashInfer autotune cache mode is 'replay' and no cache file "
+                "exists; autotuning to record the tactics in %s.",
+                cache_path,
+            )
+    elif _all_ranks_have_matching_cache(cache_path, tune_group):
         loaded = tuner.load_configs(str(cache_path))
         if tune_group.world_size > 1:
             loaded_by_rank: list[bool | None] = [None] * tune_group.world_size
@@ -480,7 +572,7 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     try:
         with (
             torch.inference_mode(),
-            fi_utils.autotune(tune_mode=True, **autotune_kwargs),
+            fi_utils.autotune(tune_mode=tune_mode, **autotune_kwargs),
         ):
             hisparse_enabled = (
                 runner.vllm_config.attention_config.hisparse_config is not None
@@ -490,7 +582,9 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 # HiSparse hot-buffer attention is bounded by decode batch
                 # size, not the prefill-sized batch used for the full model.
                 autotune_hisparse_flashinfer_attention(runner)
-            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
+            _run_flashinfer_autotune_dummy_runs(
+                runner, skip_attn=skip_attn, tune_mode=tune_mode
+            )
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())
     finally:
@@ -502,3 +596,5 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     # the file). FlashInfer gates its own autotune(cache=...) save the same way.
     if tuner._dirty:
         tuner.save_configs(str(cache_path))
+        if is_leader:
+            logger.info("Saved FlashInfer autotune cache file %s.", cache_path)

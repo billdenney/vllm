@@ -81,6 +81,7 @@ from vllm.config.cache import (
 from vllm.config.device import Device
 from vllm.config.kernel import (
     PASSTHROUGH_ALL2ALL_BACKEND,
+    FlashInferAutotuneCacheMode,
     IrOpPriorityConfig,
     LinearBackend,
     MoEBackend,
@@ -768,6 +769,9 @@ class EngineArgs:
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
     enable_flashinfer_autotune: bool = get_field(
         KernelConfig, "enable_flashinfer_autotune"
+    )
+    flashinfer_autotune_cache_mode: FlashInferAutotuneCacheMode = (
+        KernelConfig.flashinfer_autotune_cache_mode
     )
     monokernel: bool = get_field(KernelConfig, "monokernel")
     worker_cls: str = ParallelConfig.worker_cls
@@ -1823,6 +1827,10 @@ class EngineArgs:
             "--enable-flashinfer-autotune",
             **kernel_kwargs["enable_flashinfer_autotune"],
         )
+        kernel_group.add_argument(
+            "--flashinfer-autotune-cache-mode",
+            **kernel_kwargs["flashinfer_autotune_cache_mode"],
+        )
         kernel_group.add_argument("--monokernel", **kernel_kwargs["monokernel"])
         moe_backend_kwargs = kernel_kwargs["moe_backend"]
         moe_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
@@ -2777,6 +2785,10 @@ class EngineArgs:
                     "are mutually exclusive"
                 )
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
+        if self.flashinfer_autotune_cache_mode != "tune":
+            kernel_config.flashinfer_autotune_cache_mode = (
+                self.flashinfer_autotune_cache_mode
+            )
         if self.monokernel:
             kernel_config.monokernel = True
         if self.moe_backend != "auto":

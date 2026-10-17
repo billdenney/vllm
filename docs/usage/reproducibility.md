@@ -19,6 +19,25 @@ Example: [examples/rl/batch_invariance/reproducibility_offline.py](../../example
     Even with the above settings, vLLM only provides reproducibility
     when it runs on the same hardware and the same vLLM version.
 
+## Reproducibility across restarts
+
+Some kernels are chosen at startup by timing them. FlashInfer's autotuner, which
+runs during kernel warmup, benchmarks the implementations of each operation and
+keeps the fastest; two starts with identical settings can pick different ones
+when the timings are close, and then compute different numerics. vLLM saves the
+tactics it picks in the FlashInfer autotune cache (`VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`,
+else under `VLLM_CACHE_ROOT`), but by default it still times any shape the cache
+does not cover and tunes again when a cache file cannot be loaded.
+
+With `--flashinfer-autotune-cache-mode replay`, the cache becomes the record of
+the tactics: the first start (no cache file yet) tunes and saves them, and every
+later start with the same configuration loads them and times nothing. A cache
+file that is malformed, inconsistent across ranks, or rejected by FlashInfer
+(for example, written with another FlashInfer, CUDA, cuBLAS or cuDNN version or
+on another GPU) stops the start instead of being re-tuned silently. Keep the
+cache directory on persistent storage, such as a volume in a container
+deployment, and delete it to record the tactics again.
+
 ## Setting the global seed
 
 The `seed` parameter in vLLM is used to control the random states for various random number generators.

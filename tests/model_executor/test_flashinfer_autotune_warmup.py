@@ -4,7 +4,7 @@
 import json
 import sys
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager
 from inspect import signature
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -39,13 +39,14 @@ def _make_moe(*, max_deferred_tokens: int = 128, enabled: bool = True):
     return moe
 
 
-def _make_runner(modules, *, max_tokens: int = 8192):
+def _make_runner(modules, *, max_tokens: int = 8192, cache_mode: str = "tune"):
     """Create a runner carrying only the state used by FlashInfer warmup."""
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
         vllm_config=SimpleNamespace(
             attention_config=SimpleNamespace(hisparse_config=None),
             parallel_config=SimpleNamespace(data_parallel_rank=0),
+            kernel_config=SimpleNamespace(flashinfer_autotune_cache_mode=cache_mode),
         ),
         get_model=Mock(
             return_value=SimpleNamespace(modules=Mock(return_value=modules))
@@ -83,8 +84,11 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
     assert token_counts == (32,)
 
 
+@pytest.mark.parametrize("tune_mode", [True, False])
 @pytest.mark.parametrize("skip_attn", [False, True])
-def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
+def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(
+    skip_attn, tune_mode
+):
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1Runner
 
@@ -108,12 +112,16 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
         ) as get_buckets,
         patch("vllm.utils.flashinfer.autotune") as autotune,
     ):
-        _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
+        _run_flashinfer_autotune_dummy_runs(
+            runner, skip_attn=skip_attn, tune_mode=tune_mode
+        )
 
     assert get_buckets.call_args_list == [call(8192), call(128)]
+    # The inner contexts carry the tune mode: autotune(True) nested in an outer
+    # autotune(False) would time tactics again.
     assert autotune.call_args_list == [
-        call(tuning_buckets=max_buckets, round_up=True),
-        call(tuning_buckets=deferred_buckets, round_up=True),
+        call(tune_mode=tune_mode, tuning_buckets=max_buckets, round_up=True),
+        call(tune_mode=tune_mode, tuning_buckets=deferred_buckets, round_up=True),
     ]
     assert runner._dummy_run.call_args_list == [
         call(
@@ -174,6 +182,15 @@ class _AutotuneGroup:
     def all_gather_object(self, out, obj):
         # Ranks run sequentially: snapshot every rank's file before any saves.
         self.record(("all_gather",))
+        if isinstance(obj, warmup._ReplayCacheState):
+            out[:] = self.run.gathered.setdefault(
+                ("replay", self.ranks),
+                [
+                    warmup._replay_cache_state(self.run.cache_path(rank))
+                    for rank in self.ranks
+                ],
+            )
+            return
         if isinstance(obj, bool):
             out[:] = [rank not in self.run.rejected_load_ranks for rank in self.ranks]
             assert out[self.rank_in_group] == obj
@@ -213,7 +230,8 @@ class _AutotuneTuner:
         Path(path).write_text(json.dumps(self.cache))
 
     def profile(self, operation):
-        if operation in self.cache:
+        # Outside tuning mode FlashInfer takes the fallback tactic of a miss.
+        if operation in self.cache or not self.run.tune_mode:
             return
         group = self.run.tuning_group
         self.run.profile_groups[self.run.rank].append(
@@ -227,11 +245,15 @@ class _AutotuneTuner:
 
 
 class _AutotuneRun:
-    def __init__(self, pp, tp, cache_dir):
+    def __init__(self, pp, tp, cache_dir, cache_mode="tune"):
         self.pp, self.tp = pp, tp
         self.cache_dir = cache_dir
+        self.cache_mode = cache_mode
         self.rank = 0
         self.tuning_group = None
+        self.tune_mode = True
+        self.autotune_modes: dict[int, list[bool]] = defaultdict(list)
+        self.dummy_run_modes: dict[int, list[bool]] = defaultdict(list)
         self.collectives: dict[tuple[int, ...], dict[int, list[tuple[Any, ...]]]] = (
             defaultdict(lambda: defaultdict(list))
         )
@@ -257,7 +279,17 @@ class _AutotuneRun:
     def set_group(self, group):
         self.tuning_group = group
 
-    def dummy_runs(self, runner, *, skip_attn=False):
+    @contextmanager
+    def autotune(self, *, tune_mode=True, **kwargs):
+        self.autotune_modes[self.rank].append(tune_mode)
+        self.tune_mode = tune_mode
+        try:
+            yield
+        finally:
+            self.tune_mode = True
+
+    def dummy_runs(self, runner, *, skip_attn=False, tune_mode=True):
+        self.dummy_run_modes[self.rank].append(tune_mode)
         self.tuners[self.rank].profile("shared_gemm")
         if self.pp > 1 and self.rank // self.tp == 0:
             self.tuners[self.rank].profile("pp0_extra_gemm")
@@ -266,7 +298,7 @@ class _AutotuneRun:
         for rank in range(self.pp * self.tp):
             self.rank = rank
             self.tuners[rank] = _AutotuneTuner(self)
-            flashinfer_autotune(_make_runner([]))
+            flashinfer_autotune(_make_runner([], cache_mode=self.cache_mode))
         return self
 
     def assert_collectives_match(self):
@@ -281,8 +313,8 @@ def autotune_run(monkeypatch, tmp_path):
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed import parallel_state
 
-    def make_run(*, pp=2, tp=4):
-        run = _AutotuneRun(pp, tp, tmp_path)
+    def make_run(*, pp=2, tp=4, cache_mode="tune"):
+        run = _AutotuneRun(pp, tp, tmp_path, cache_mode)
         autotuner = ModuleType("flashinfer.autotuner")
         monkeypatch.setattr(
             autotuner,
@@ -297,7 +329,7 @@ def autotune_run(monkeypatch, tmp_path):
         monkeypatch.setattr(parallel_state, "get_world_group", run.world)
         monkeypatch.setattr(parallel_state, "get_tp_group", run.tensor_group)
         monkeypatch.setattr(parallel_state, "get_pp_group", run.pipeline_group)
-        monkeypatch.setattr(fi_utils, "autotune", lambda **kwargs: nullcontext())
+        monkeypatch.setattr(fi_utils, "autotune", run.autotune)
         monkeypatch.setattr(
             "torch.distributed.all_gather_object",
             lambda out, obj, group: group.all_gather_object(out, obj),
@@ -417,3 +449,93 @@ def test_autotune_cache_key_normalizes_kv_init_fields():
         _normalize_cache_config_for_hash(resolved).compute_hash()
         != fresh.compute_hash()
     )
+
+
+def test_cache_mode_defaults_to_tune_and_is_outside_the_cache_key():
+    """Replay must find the file a tune-mode start wrote under the same key."""
+    from vllm.config.kernel import KernelConfig
+
+    assert KernelConfig().flashinfer_autotune_cache_mode == "tune"
+    replay = KernelConfig(flashinfer_autotune_cache_mode="replay")
+    assert replay.compute_hash() == KernelConfig().compute_hash()
+    # Negative control: a hashed kernel option does change the key.
+    assert KernelConfig(moe_backend="triton").compute_hash() != (
+        KernelConfig().compute_hash()
+    )
+
+
+@pytest.mark.parametrize("pp, tp", [(1, 1), (1, 4), (2, 4)])
+def test_replay_records_once_then_loads_without_timing(autotune_run, pp, tp):
+    ranks = range(pp * tp)
+    record = autotune_run(pp=pp, tp=tp, cache_mode="replay").execute()
+    record.assert_collectives_match()
+    saved = {rank: cache for rank, _, cache in record.saves}
+    assert set(saved) == set(ranks)
+    assert dict(record.autotune_modes) == {rank: [True] for rank in ranks}
+    assert dict(record.dummy_run_modes) == {rank: [True] for rank in ranks}
+
+    replay = autotune_run(pp=pp, tp=tp, cache_mode="replay").execute()
+    replay.assert_collectives_match()
+    assert not replay.profile_groups
+    assert not replay.saves
+    assert dict(replay.autotune_modes) == {rank: [False] for rank in ranks}
+    assert dict(replay.dummy_run_modes) == {rank: [False] for rank in ranks}
+    assert {rank: tuner.loaded for rank, tuner in replay.tuners.items()} == saved
+
+
+def test_replay_does_not_time_shapes_missing_from_the_file(autotune_run):
+    replay = autotune_run(pp=1, tp=1, cache_mode="replay")
+    replay.cache_path(0).write_text("{}")
+    replay.execute()
+    assert replay.tuners[0].loaded == {}
+    assert not replay.profile_groups
+    assert not replay.saves
+    # Negative control: tune mode times the same miss and saves it.
+    tune = autotune_run(pp=1, tp=1).execute()
+    assert dict(tune.profile_groups) == {0: [None]}
+    assert [rank for rank, _, _ in tune.saves] == [0]
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_replay_refuses_a_malformed_file(autotune_run, tp):
+    autotune_run(pp=1, tp=tp, cache_mode="replay").execute()
+    replay = autotune_run(pp=1, tp=tp, cache_mode="replay")
+    replay.cache_path(tp - 1).write_text("{not json")
+    with pytest.raises(RuntimeError, match=rf"rank {tp - 1}: malformed"):
+        replay.execute()
+    assert not replay.profile_groups
+    assert not replay.saves
+
+
+def test_replay_refuses_files_missing_on_some_ranks(autotune_run):
+    autotune_run(pp=1, tp=4, cache_mode="replay").execute()
+    replay = autotune_run(pp=1, tp=4, cache_mode="replay")
+    replay.cache_path(2).unlink()
+    with pytest.raises(RuntimeError, match=r"\(rank 2: missing;"):
+        replay.execute()
+    assert not replay.profile_groups
+    assert not replay.saves
+
+
+def test_replay_refuses_files_that_differ_across_ranks(autotune_run):
+    autotune_run(pp=1, tp=4, cache_mode="replay").execute()
+    replay = autotune_run(pp=1, tp=4, cache_mode="replay")
+    stale = replay.cache_path(1)
+    stale.write_text(json.dumps({**json.loads(stale.read_text()), "old_gemm": 0}))
+    with pytest.raises(RuntimeError, match="differ across the ranks"):
+        replay.execute()
+    assert not replay.profile_groups
+    assert not replay.saves
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_replay_refuses_a_file_flashinfer_rejects(autotune_run, tp):
+    autotune_run(pp=1, tp=tp, cache_mode="replay").execute()
+    replay = autotune_run(pp=1, tp=tp, cache_mode="replay")
+    replay.rejected_load_ranks = {tp - 1}
+    with pytest.raises(
+        RuntimeError, match=rf"rejected the cache file on ranks \[{tp - 1}\]"
+    ):
+        replay.execute()
+    assert not replay.profile_groups
+    assert not replay.saves

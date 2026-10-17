@@ -806,6 +806,45 @@ def test_ir_op_priority():
 
 
 @pytest.mark.parametrize(
+    ("args", "top_level", "in_kernel_config"),
+    [
+        ([], "tune", "tune"),
+        (["--flashinfer-autotune-cache-mode", "replay"], "replay", "tune"),
+        (
+            ["--kernel-config", '{"flashinfer_autotune_cache_mode": "replay"}'],
+            "tune",
+            "replay",
+        ),
+        (
+            ["--kernel-config.flashinfer_autotune_cache_mode", "replay"],
+            "tune",
+            "replay",
+        ),
+    ],
+)
+def test_flashinfer_autotune_cache_mode_args(args, top_level, in_kernel_config):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    engine_args = EngineArgs.from_cli_args(parser.parse_args(args))
+    assert engine_args.flashinfer_autotune_cache_mode == top_level
+    assert engine_args.kernel_config.flashinfer_autotune_cache_mode == (
+        in_kernel_config
+    )
+
+
+def test_flashinfer_autotune_cache_mode_rejects_unknown_modes():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
+    with pytest.raises(ArgumentError):
+        parser.parse_args(["--flashinfer-autotune-cache-mode", "record"])
+
+
+def test_flashinfer_autotune_cache_mode_reaches_kernel_config():
+    default = EngineArgs().create_engine_config()
+    assert default.kernel_config.flashinfer_autotune_cache_mode == "tune"
+    replay = EngineArgs(flashinfer_autotune_cache_mode="replay").create_engine_config()
+    assert replay.kernel_config.flashinfer_autotune_cache_mode == "replay"
+
+
+@pytest.mark.parametrize(
     ("input_json", "expected_json"),
     [
         # Decimal suffixes (lowercase)

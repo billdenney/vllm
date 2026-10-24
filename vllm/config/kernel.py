@@ -288,9 +288,12 @@ class KernelConfig:
     """Load the saved FlashInfer autotune cache instead of autotuning at
     startup. Every rank loads its own legacy per-rank cache file; startup fails
     on every rank if any rank's file is missing, empty, unreadable, or rejected
-    by FlashInfer, and never falls back to autotuning. Not supported where the
-    FlashInfer managed autotune cache is used (currently single-GPU
-    deployments). No effect when FlashInfer autotune is disabled."""
+    by FlashInfer, and never falls back to autotuning. Where the FlashInfer
+    managed autotune cache is used (currently single-GPU deployments), the
+    store is replayed: startup fails if it has no entry for this environment
+    or an entry FlashInfer would ignore, and the warmup's op shapes without an
+    entry are counted and logged. No effect when FlashInfer autotune is
+    disabled."""
 
     enable_rocm_segmented_attn_autotune: bool = False
     """If True, autotune ROCm segmented attention during kernel warmup on RDNA GPUs."""

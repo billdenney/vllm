@@ -3,11 +3,14 @@
 """FlashInfer autotune cache helpers."""
 
 import hashlib
+import json
 import os
 import tempfile
-from contextlib import suppress
+from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -184,6 +187,84 @@ def load_flashinfer_autotune_cache_only(
             f"autotune cache could not be loaded: {failures}. Drop the flag "
             "to autotune, or prepare a cache for this configuration."
         )
+
+
+def check_managed_flashinfer_autotune_cache(tuner: Any) -> int:
+    """Check the managed store a cache-only start replays, or fail.
+
+    FlashInfer treats a missing, malformed or misplaced entry as a cache miss
+    and serves the default tactic, so a cache-only start refuses a store with
+    no entry for this environment, or with an entry FlashInfer would ignore.
+    The managed path runs on one rank only (``use_flashinfer_autotune_v2``),
+    so the decision needs no collective. Call it inside the
+    ``autotune_v2(mode="replay")`` context, which attaches the store.
+
+    Returns:
+        The number of entries in the store.
+
+    Raises:
+        RuntimeError: If no store is attached, or the store has no entries,
+            or an entry is unreadable or not stored under its own key.
+
+    """
+    store = tuner._managed_cache
+    if store is None:
+        raise RuntimeError(
+            "--flashinfer-autotune-cache-only is set but no FlashInfer managed "
+            "autotune cache is attached."
+        )
+    entries_dir = Path(store.entries_dir)
+    paths = sorted(entries_dir.glob("*.json")) if entries_dir.is_dir() else []
+    if not paths:
+        raise RuntimeError(
+            "--flashinfer-autotune-cache-only is set but the FlashInfer managed "
+            f"autotune cache has no entries for this environment ({entries_dir}). "
+            "Drop the flag to autotune, or prepare the cache with a start "
+            "without it."
+        )
+    invalid = []
+    for path in paths:
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            key = entry["key"]
+            # Where ManagedAutotuneCache._entry_path files an entry.
+            expected = hashlib.sha256(key.encode()).hexdigest()[:24]
+            if path.stem != expected or "runner" not in entry or "tactic" not in entry:
+                raise ValueError("not an entry stored under its own key")
+        except Exception as exc:
+            invalid.append(f"{path.name}: {type(exc).__name__}: {exc}")
+    if invalid:
+        raise RuntimeError(
+            "--flashinfer-autotune-cache-only is set but the FlashInfer managed "
+            f"autotune cache {entries_dir} holds entries FlashInfer would ignore: "
+            f"{'; '.join(invalid)}. Drop the flag to autotune, or prepare the "
+            "cache again."
+        )
+    return len(paths)
+
+
+@contextmanager
+def count_flashinfer_autotune_misses(tuner: Any) -> Iterator[dict[str, set]]:
+    """Collect the op shapes that fall back to FlashInfer's default tactic.
+
+    Outside tuning, FlashInfer's ``AutoTuner.choose_one`` serves a lookup
+    without a cached winner with the default tactic and records it nowhere,
+    so the lookups are counted here: op name to the input shapes that missed.
+    """
+    misses: dict[str, set] = defaultdict(set)
+    search_cache = tuner.search_cache
+
+    def counted(custom_op, runners, input_shapes, *args, **kwargs):
+        result = search_cache(custom_op, runners, input_shapes, *args, **kwargs)
+        if not result[0]:
+            misses[custom_op].add(tuple(tuple(shape) for shape in input_shapes))
+        return result
+
+    tuner.search_cache = counted
+    try:
+        yield misses
+    finally:
+        del tuner.search_cache
 
 
 def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:

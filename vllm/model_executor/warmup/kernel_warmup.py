@@ -8,6 +8,7 @@ happen during model execution.
 import json
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,8 @@ from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    check_managed_flashinfer_autotune_cache,
+    count_flashinfer_autotune_misses,
     load_flashinfer_autotune_cache_only,
     resolve_flashinfer_autotune_file,
     resolve_flashinfer_autotune_v2_root,
@@ -350,7 +353,7 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
 
 
 def _run_flashinfer_autotune_dummy_runs(
-    runner: "GPUModelRunner", *, skip_attn: bool = False
+    runner: "GPUModelRunner", *, skip_attn: bool = False, tune_mode: bool = True
 ) -> None:
     import vllm.utils.flashinfer as fi_utils
 
@@ -381,7 +384,11 @@ def _run_flashinfer_autotune_dummy_runs(
         )
         # Round M up to match serving-time bucket selection for non-bucket M.
         # See https://github.com/flashinfer-ai/flashinfer/issues/5450
-        with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):
+        # FlashInfer counts tuning contexts, so an inner autotune() that
+        # tunes would time and publish the misses of an outer replay.
+        with fi_utils.autotune(
+            tune_mode=tune_mode, tuning_buckets=tuning_buckets, round_up=True
+        ):
             runner._dummy_run(
                 num_tokens=num_tokens,
                 skip_eplb=True,
@@ -462,14 +469,10 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
 
     cache_only = runner.vllm_config.kernel_config.flashinfer_autotune_cache_only
     use_autotune_v2 = use_flashinfer_autotune_v2(runner)
-    if cache_only and use_autotune_v2:
-        # The managed cache replays misses with default tactics instead of
-        # failing, and this deployment never writes the per-rank files.
-        raise RuntimeError(
-            "--flashinfer-autotune-cache-only is not supported where vLLM uses "
-            "FlashInfer's managed autotune cache (currently single-GPU "
-            "deployments); drop the flag."
-        )
+    # The managed cache serves a miss with the default tactic instead of
+    # failing, so a cache-only start replays it, refuses a store FlashInfer
+    # would not serve from, and counts the misses of the warm-up.
+    replay_managed = cache_only and use_autotune_v2
     if use_autotune_v2:
         from flashinfer import autotune_v2, autotune_v2_reload
 
@@ -481,7 +484,9 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 cache_root if cache_root is not None else "flashinfer default",
             )
         autotune_context = autotune_v2(
-            mode="tune", cache_root=cache_root, **autotune_kwargs
+            mode="replay" if replay_managed else "tune",
+            cache_root=cache_root,
+            **autotune_kwargs,
         )
     else:
         cache_path = resolve_flashinfer_autotune_file(runner)
@@ -525,8 +530,18 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
 
     group = tune_group.cpu_group if tune_group.world_size > 1 else None
     set_autotune_process_group(group)
+    misses: dict[str, set] | None = None
     try:
-        with torch.inference_mode(), autotune_context:
+        with (
+            torch.inference_mode(),
+            autotune_context,
+            count_flashinfer_autotune_misses(tuner)
+            if replay_managed
+            else nullcontext() as counted,
+        ):
+            if replay_managed:
+                misses = counted
+                entries = check_managed_flashinfer_autotune_cache(tuner)
             hisparse_enabled = (
                 runner.vllm_config.attention_config.hisparse_config is not None
             )
@@ -535,11 +550,36 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 # HiSparse hot-buffer attention is bounded by decode batch
                 # size, not the prefill-sized batch used for the full model.
                 autotune_hisparse_flashinfer_attention(runner)
-            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
+            _run_flashinfer_autotune_dummy_runs(
+                runner, skip_attn=skip_attn, tune_mode=not replay_managed
+            )
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())
     finally:
         set_autotune_process_group(None)
+
+    if misses is not None and is_leader:
+        shapes = sum(len(op_shapes) for op_shapes in misses.values())
+        if shapes:
+            logger.warning(
+                "Replayed the FlashInfer managed autotune cache (%d entries) "
+                "because --flashinfer-autotune-cache-only is set; %d op shapes "
+                "of the warmup had no entry and use FlashInfer's default "
+                "tactic: %s.",
+                entries,
+                shapes,
+                ", ".join(
+                    f"{op} ({len(op_shapes)})"
+                    for op, op_shapes in sorted(misses.items())
+                ),
+            )
+        else:
+            logger.info(
+                "Replayed the FlashInfer managed autotune cache (%d entries) "
+                "because --flashinfer-autotune-cache-only is set; every op "
+                "shape of the warmup had an entry.",
+                entries,
+            )
 
     if world.world_size > 1:
         world.barrier()

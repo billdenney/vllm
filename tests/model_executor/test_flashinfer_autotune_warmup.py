@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import json
 import sys
 import threading
@@ -121,8 +122,8 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
 
     assert get_buckets.call_args_list == [call(8192), call(128)]
     assert autotune.call_args_list == [
-        call(tuning_buckets=max_buckets, round_up=True),
-        call(tuning_buckets=deferred_buckets, round_up=True),
+        call(tune_mode=True, tuning_buckets=max_buckets, round_up=True),
+        call(tune_mode=True, tuning_buckets=deferred_buckets, round_up=True),
     ]
     assert runner._dummy_run.call_args_list == [
         call(
@@ -898,11 +899,135 @@ def test_cache_only_load_failure_on_any_rank_fails_every_rank(
     assert not run.autotuned and not run.kda_models
 
 
-def test_cache_only_rejects_managed_cache_deployments(cache_only_run):
-    """The managed cache would replay misses instead of failing closed."""
+def _managed_entry(entries_dir, key, **fields):
+    """One entry of a managed store, filed where FlashInfer files it."""
+    entries_dir.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(key.encode()).hexdigest()[:24]
+    entry = {"key": key, "runner": "Runner", "tactic": 1, **fields}
+    (entries_dir / f"{name}.json").write_text(json.dumps(entry))
+    return entries_dir / f"{name}.json"
+
+
+@pytest.fixture
+def managed_cache_only_run(cache_only_run, monkeypatch, tmp_path):
+    """A one-rank cache-only start on the managed path: FlashInfer's
+    autotune_v2 attaches a store of ``entries_dir``, and the warmup looks up
+    ``gemm`` (in the store when an entry names it) and ``moe`` (never)."""
+    entries_dir = tmp_path / "v2" / "env" / "entries"
     run = cache_only_run(tp=1, managed_cache=True)
-    _write_rank_caches(run)
+    run.modes = []
+    run.tune_modes = []
+    run.logged = []
+
+    @contextmanager
+    def autotune_v2(mode, cache_root=None, **kwargs):
+        run.modes.append(mode)
+        run.tuners[0]._managed_cache = SimpleNamespace(entries_dir=entries_dir)
+        yield
+
+    flashinfer = ModuleType("flashinfer")
+    flashinfer.autotune_v2 = autotune_v2
+    flashinfer.autotune_v2_reload = lambda: None
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
+
+    def search_cache(tuner, custom_op, runners, input_shapes, *args, **kwargs):
+        stored = {
+            json.loads(path.read_text())["key"] for path in entries_dir.glob("*.json")
+        }
+        return custom_op in stored, 0, -1, None
+
+    monkeypatch.setattr(_CacheOnlyTuner, "search_cache", search_cache, raising=False)
+
+    def dummy_runs(runner, **kwargs):
+        run.tune_modes.append(kwargs.get("tune_mode", True))
+        tuner = run.tuners[run.rank]
+        for op in ("gemm", "moe"):
+            tuner.search_cache(op, [], (torch.Size([8, 16]),))
+
+    monkeypatch.setattr(warmup, "_run_flashinfer_autotune_dummy_runs", dummy_runs)
+    for level in ("info", "warning"):
+        monkeypatch.setattr(
+            warmup.logger,
+            level,
+            # info_once and warning_once pass stacklevel on.
+            lambda msg, *args, level=level, **kwargs: run.logged.append(
+                (level, msg % args)
+            ),
+        )
+    run.entries_dir = entries_dir
+    return run
+
+
+def test_cache_only_replays_the_managed_cache_and_counts_misses(
+    managed_cache_only_run,
+):
+    """One rank replays the managed store, times nothing, and logs the op
+    shapes that use FlashInfer's default tactic."""
+    run = managed_cache_only_run
+    _managed_entry(run.entries_dir, "gemm")
     run.execute()
-    assert "managed autotune cache" in str(run.errors[0])
+    assert not run.errors
+    assert run.modes == ["replay"]
+    # The dummy runs' own autotune() context must not tune under the replay.
+    assert run.tune_modes == [False]
     assert run.tuners[0].loaded is None
-    assert not run.autotuned and not run.kda_models
+    # The instance's counter is gone once the warmup ends.
+    assert "search_cache" not in vars(run.tuners[0])
+    assert (
+        "warning",
+        "Replayed the FlashInfer managed autotune cache (1 entries) because "
+        "--flashinfer-autotune-cache-only is set; 1 op shapes of the warmup had "
+        "no entry and use FlashInfer's default tactic: moe (1).",
+    ) in run.logged
+
+
+def test_cache_only_replay_without_misses_says_so(managed_cache_only_run):
+    run = managed_cache_only_run
+    _managed_entry(run.entries_dir, "gemm")
+    _managed_entry(run.entries_dir, "moe")
+    run.execute()
+    assert not run.errors
+    assert (
+        "info",
+        "Replayed the FlashInfer managed autotune cache (2 entries) because "
+        "--flashinfer-autotune-cache-only is set; every op shape of the warmup "
+        "had an entry.",
+    ) in run.logged
+
+
+@pytest.mark.parametrize(
+    "corrupt, fragment",
+    [
+        (None, "has no entries for this environment"),
+        (lambda path: path.write_text("{"), "JSONDecodeError"),
+        (lambda path: path.write_text(json.dumps({"runner": "R"})), "KeyError"),
+        (
+            lambda path: path.rename(path.with_name("0" * 24 + ".json")),
+            "not an entry stored under its own key",
+        ),
+    ],
+)
+def test_cache_only_refuses_a_managed_cache_flashinfer_would_ignore(
+    managed_cache_only_run, corrupt, fragment
+):
+    """An empty store, or an entry FlashInfer would treat as a miss, stops
+    the start before the warmup runs."""
+    run = managed_cache_only_run
+    if corrupt is not None:
+        corrupt(_managed_entry(run.entries_dir, "gemm"))
+    run.execute()
+    assert "--flashinfer-autotune-cache-only" in str(run.errors[0])
+    assert fragment in str(run.errors[0])
+    assert run.modes == ["replay"]
+    assert run.tune_modes == [] and not run.kda_models
+
+
+def test_managed_tune_mode_is_unchanged(managed_cache_only_run):
+    """Without the flag the managed path tunes as before."""
+    run = managed_cache_only_run
+    runner = _make_runner([], cache_only=False)
+    run.local.rank = 0
+    run.tuners[0] = _CacheOnlyTuner(True)
+    warmup.flashinfer_autotune(runner)
+    assert run.modes == ["tune"]
+    assert run.tune_modes == [True]

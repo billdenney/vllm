@@ -550,8 +550,10 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 # HiSparse hot-buffer attention is bounded by decode batch
                 # size, not the prefill-sized batch used for the full model.
                 autotune_hisparse_flashinfer_attention(runner)
+            # Only a replay changes the dummy runs' own tuning context.
+            replay_kwargs = {"tune_mode": False} if replay_managed else {}
             _run_flashinfer_autotune_dummy_runs(
-                runner, skip_attn=skip_attn, tune_mode=not replay_managed
+                runner, skip_attn=skip_attn, **replay_kwargs
             )
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())

@@ -945,6 +945,9 @@ def managed_cache_only_run(cache_only_run, monkeypatch, tmp_path):
             tuner.search_cache(op, [], (torch.Size([8, 16]),))
 
     monkeypatch.setattr(warmup, "_run_flashinfer_autotune_dummy_runs", dummy_runs)
+    # The managed path runs the whole warmup, which the cache-only fixture's
+    # runner cannot.
+    monkeypatch.setattr(warmup, "replayssm_autotune_warmup", lambda runner: None)
     for level in ("info", "warning"):
         monkeypatch.setattr(
             warmup.logger,
